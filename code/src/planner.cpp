@@ -12,6 +12,8 @@
 #include <queue>
 #include <cstring>
 #include <cassert>
+#include <limits>
+
 #include "GenericPlanner.cpp"
 
 #define DEBUG 0
@@ -429,6 +431,8 @@ struct ActionHasher
 {
     size_t operator()(const Action &ac) const
     {
+        // std::string s = "";
+        // for (std::string s: ac.get_args()) {}
         return hash<string>{}(ac.get_name());
     }
 };
@@ -446,6 +450,14 @@ class GroundedAction
     UMap_StrStr substitutions;
 
 public:
+    GroundedAction() {
+        name == "PLACEHOLDER";
+        arg_values.clear();
+        get_arg_values().clear();
+        groundedEffects.clear();
+        substitutions.clear();
+    }
+
     GroundedAction(const string &name, const list<string> &arg_values)
     {
         this->name = name;
@@ -972,12 +984,14 @@ Env *create_env(char *filename)
 class State {
 public:
     USet_gcond currConditions;
-    std::vector<GroundedAction> actionsSeq;
+    GroundedAction actionToThisState;
+    size_t parentIdx;
     float priority;
 
-    State(const USet_gcond& stateConditions, const std::vector<GroundedAction> actionsTillThisState, float p):
+    State(const USet_gcond& stateConditions, const GroundedAction action_to_this_state, size_t parent_idx, float p):
         currConditions(stateConditions),
-        actionsSeq(actionsTillThisState),
+        actionToThisState(action_to_this_state),
+        parentIdx(parent_idx),
         priority(p) {}
 
     State applyGAction(const GroundedAction& gAction) const {
@@ -990,7 +1004,7 @@ public:
                 newState.currConditions.erase(gEff); // TODO do I need to construct a new one here?
             }
         }
-        newState.actionsSeq.push_back(gAction);
+        newState.actionToThisState = gAction;
         return newState;
     }
 
@@ -999,7 +1013,7 @@ public:
         const USet_gcond& preconds = gAction.getGroundedPreconditions();
 
         for (auto precond_it = preconds.begin(); precond_it != preconds.end(); ++precond_it) {
-            if (currStateGConditions.find(*precond_it) == preconds.end()) {
+            if (currStateGConditions.find(*precond_it) == currStateGConditions.end()) {
                 return false;
             }
         }
@@ -1013,9 +1027,8 @@ public:
             os << c << ", ";
         os << endl;
 
-        os << "Actions till here: ";
-        for (const GroundedAction &a : s.actionsSeq)
-            os << a << endl;
+        os << "Actions to this state";
+        os << s.actionToThisState << endl;
         os << endl;
         return os;
     }
@@ -1030,30 +1043,8 @@ inline void hash_combine(std::size_t& seed, std::size_t hashValue) {
 struct StateEq {
     bool operator()(const State& lhs, const State& rhs) const {
         return lhs.currConditions == rhs.currConditions &&
-               lhs.actionsSeq == rhs.actionsSeq &&
+               lhs.actionToThisState == rhs.actionToThisState &&
                lhs.priority == rhs.priority;
-    }
-};
-
-// Define hash function for State
-struct StateHasher {
-    std::size_t operator()(const State& s) const {
-        std::size_t seed = 0;
-
-        // Hash all grounded conditions
-        for (const auto& cond : s.currConditions) {
-            hash_combine(seed, GroundedConditionHasher{}(cond));
-        }
-
-        // Hash all actions in the sequence
-        for (const auto& act : s.actionsSeq) {
-            hash_combine(seed, GroundedActionHasher{}(act));
-        }
-
-        // Optionally include priority
-        hash_combine(seed, std::hash<float>{}(s.priority));
-
-        return seed;
     }
 };
 
@@ -1081,6 +1072,24 @@ bool checkIfGoal(const Env* env, const State& currState) {
     return true;
 }
 
+std::vector<GroundedAction> constructStart2Goal(size_t goalIdx) {
+    std::vector<GroundedAction> start2Goal;
+    start2Goal.reserve(32);
+
+    size_t idx = goalIdx;
+    while (idx != std::numeric_limits<size_t>::max()) {
+        const State &s = listOfStates[idx];
+
+        if (s.parentIdx == std::numeric_limits<size_t>::max()) break;
+
+        start2Goal.push_back(s.actionToThisState);
+        idx = s.parentIdx;
+    }
+
+    std::reverse(start2Goal.begin(), start2Goal.end());
+    return start2Goal;
+}
+
 /**
  * Returns true for the element with the larger value.
  * In a PQ, smaller values are returned before larger values
@@ -1104,17 +1113,17 @@ list<GroundedAction> planner(Env* env)
 
     // get all the symbols in the environment as a vector
     std::vector<string> symbolList;
+    symbolList.reserve(16);
     const unordered_set<string>& symbol_set = env->get_symbols();
     for (auto it = symbol_set.begin(); it != env->get_symbols().end(); ++it) {
         symbolList.push_back(*it);
     }
 
     // Initializing the first state as start state and putting it in init
-    State startState = State(env->get_initial_conditions(), std::vector<GroundedAction>(), 0); // Passing empty actions
-    listOfStates.push_back(startState);
+    listOfStates.emplace_back(env->get_initial_conditions(), GroundedAction(), std::numeric_limits<size_t>::max(), 0);
     OpenList.push(0);
 
-    State goalState = State(env->get_goal_conditions(), std::vector<GroundedAction>(), 0);
+    State goalState = State(env->get_goal_conditions(), GroundedAction(), std::numeric_limits<size_t>::max(), 0);
 
     // run the planner
     while (!OpenList.empty()) {
@@ -1125,7 +1134,8 @@ list<GroundedAction> planner(Env* env)
         }
 
         if (checkIfGoal(env, currState)) {
-            return vector2list(currState.actionsSeq);
+            listOfStates.push_back(goalState);
+            return vector2list(constructStart2Goal(listOfStates.size() - 1));
         }
 
         // For all possible actions in the environment
